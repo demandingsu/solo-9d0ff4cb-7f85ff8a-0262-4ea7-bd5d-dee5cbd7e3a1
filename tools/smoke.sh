@@ -39,3 +39,21 @@ JOB="$(submit "$ROOT/samples/truncated_R1.fastq.gz" "$ROOT/samples/truncated_R2.
 ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"
 wait_job "$ID" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['status'],d['error'])"
 echo "# download status: $(curl -s -o /dev/null -w '%{http_code}' "$BASE/jobs/$ID/download/r1")"
+
+echo "# merge sample (QC keeps 6 pairs; merge: 3 merged, 1 no_overlap, 1 ambiguous, 1 non_acgt)"
+JOB="$(submit "$ROOT/samples/merge_R1.fastq.gz" "$ROOT/samples/merge_R2.fastq.gz" 20)"
+ID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["job_id"])' <<<"$JOB")"
+wait_job "$ID" | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['status'],'kept:',d['kept_pairs'])"
+MERGE="$(curl -sf -X POST "$BASE/merge-jobs" -F "job_id=$ID")"
+MID="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["merge_id"])' <<<"$MERGE")"
+for _ in $(seq 1 100); do
+  body="$(curl -sf "$BASE/merge-jobs/$MID")"
+  status="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])' <<<"$body")"
+  case "$status" in
+    succeeded|failed|stopped) break ;;
+  esac
+  sleep 0.1
+done
+python3 -c "import json,sys;d=json.load(sys.stdin);print(d['status'],'merged:',d['merged_pairs'],'no_overlap:',d['no_overlap_pairs'],'ambiguous:',d['ambiguous_pairs'],'non_acgt:',d['non_acgt_pairs'])" <<<"$body"
+curl -sf -o /tmp/smoke_merged.gz "$BASE/merge-jobs/$MID/download"
+python3 -c "import gzip;print('# merged records:', gzip.open('/tmp/smoke_merged.gz').read().count(b'\n')//4)"

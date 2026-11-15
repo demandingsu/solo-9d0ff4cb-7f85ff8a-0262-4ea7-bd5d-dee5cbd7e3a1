@@ -1,8 +1,12 @@
-# 双端 FASTQ 质控 API
+# 双端 FASTQ 质控 + 共识合并 API
 
 FastAPI 实现的成对 FASTQ 质量过滤服务：上传 `R1.fastq.gz` / `R2.fastq.gz`
 与 Phred+33 质量阈值，后台流式处理，支持查询状态、停止任务、下载过滤后的
 成对 gzip 结果。
+
+质控成功的任务可以继续提交**合并任务**：逐对读取已发布的 R1/R2，将 R2 反向
+互补后寻找唯一尾首重叠，把短片段双端读段合成单端共识读段（供变异检测使
+用），同样支持查询、停止与下载。
 
 ## 快速启动
 
@@ -37,6 +41,11 @@ QC_DATA_DIR=./data uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/jobs/{job_id}/stop` | 请求停止；已完成/失败的任务返回 `409` |
 | `GET` | `/jobs/{job_id}/download/r1` | 下载过滤后的 R1（仅成功任务） |
 | `GET` | `/jobs/{job_id}/download/r2` | 下载过滤后的 R2（仅成功任务） |
+| `POST` | `/merge-jobs` | 表单字段 `job_id` 提交**已成功**的质控任务号，返回 `202` 与合并任务号；任务未知返回 `404`，质控未成功返回 `409` |
+| `GET` | `/merge-jobs/{merge_id}` | 查询合并状态、进度与各项计数 |
+| `GET` | `/merge-jobs` | 列出所有合并任务（新到旧） |
+| `POST` | `/merge-jobs/{merge_id}/stop` | 请求停止合并；已完成/失败的返回 `409` |
+| `GET` | `/merge-jobs/{merge_id}/download` | 下载合并后的单端 FASTQ.gz（仅成功任务） |
 
 `min_quality` 为 0..93 的整数（Phred+33 可表示的范围）。上传字段名固定为
 `r1`、`r2`。
@@ -59,6 +68,18 @@ curl -X POST http://localhost:8000/jobs/<job_id>/stop
 # 成功后可下载
 curl -OJ http://localhost:8000/jobs/<job_id>/download/r1
 curl -OJ http://localhost:8000/jobs/<job_id>/download/r2
+
+# 质控成功后提交合并任务
+curl -X POST http://localhost:8000/merge-jobs -F 'job_id=<job_id>'
+
+# 查询合并进度与计数
+curl http://localhost:8000/merge-jobs/<merge_id>
+
+# 停止合并
+curl -X POST http://localhost:8000/merge-jobs/<merge_id>/stop
+
+# 合并成功后下载单端共识读段
+curl -OJ http://localhost:8000/merge-jobs/<merge_id>/download
 ```
 
 ### 状态字段
@@ -113,6 +134,41 @@ curl -OJ http://localhost:8000/jobs/<job_id>/download/r2
 9. 只有 `succeeded` 任务提供下载；失败或停止均返回 `409`，不会给出半成品。
    输出先在 `.part` 文件中完整写入，成功后才原子改名发布。
 
+## 合并规则
+
+合并任务以**已成功**质控任务的已发布 R1/R2 结果为输入，逐对流式处理：
+
+1. 每对读段先把 R2 反向互补（质量行同步反转），使两端同向。
+2. 在 R1 尾部与 R2 反向互补序列头部之间寻找重叠：长度 **≥ 20** 且错配
+   **≤ 1** 的长度为候选；**候选长度唯一**才合并。
+3. 重叠区共识：两端碱基一致时保留该碱基并取**较高**质量；不一致时，质量
+   差 **≥ 5** 采用高质量端的碱基与质量，否则写 `N` 与最低质量 `!`。
+   重叠区外的侧翼序列与质量原样保留。
+4. 以下读段**分别计数、不产出记录**：无合规重叠（`no_overlap_pairs`）、
+   候选长度多解（`ambiguous_pairs`）、任一端含非 ACGT 碱基
+   （`non_acgt_pairs`，优先于前两项判定）。
+5. 合并结果按原顺序写成单端 FASTQ.gz，读段名去掉 `/1` 后缀。
+6. 与质控相同的工程约束：全程流式、输出先写 `.part` 成功后原子发布；
+   输入 gzip 损坏（含尾部截断）、写入失败或接受停止都不会留下半成品；
+   `stopped` 只在清理完成后上报；处理期间其他任务的查询不受影响。
+7. 合并只读取质控产物，不修改它们：原质控任务的 R1/R2 下载保持可用。
+
+合并任务成功时的状态示例：
+
+```json
+{
+  "status": "succeeded",
+  "source_job_id": "<qc_job_id>",
+  "total_pairs": 6,
+  "merged_pairs": 3,
+  "no_overlap_pairs": 1,
+  "ambiguous_pairs": 1,
+  "non_acgt_pairs": 1,
+  "downloads": {"merged": "/merge-jobs/<merge_id>/download"},
+  "error": null
+}
+```
+
 ## 本地样例
 
 `tools/make_samples.py` 可重新生成 `samples/` 下的样例：
@@ -123,6 +179,7 @@ curl -OJ http://localhost:8000/jobs/<job_id>/download/r2
 | `bad_R1/R2.fastq.gz` | 3 对全部因低质量被丢弃 |
 | `mixed_R1/R2.fastq.gz` | 7 对，前 3 与最后 1 对保留，中间 3 对丢弃（阈值 20） |
 | `truncated_R1.fastq.gz` + `truncated_R2.fastq.gz` | R2 的 gzip 流末尾被截断，任务必定失败为 `gzip_corrupt` |
+| `merge_R1/R2.fastq.gz` | 6 对全部通过质控；合并结果为 3 对合并、1 对无重叠、1 对多解、1 对含 N |
 
 ```bash
 python tools/make_samples.py
@@ -136,7 +193,9 @@ python -m pytest tests -q
 ```
 
 测试覆盖过滤/顺序/阈值边界、各类强制失败、停止语义（含停止抢先于完成/
-失败、清理时序）、处理期间查询响应性，以及流式读取行数上限。
+失败、清理时序）、处理期间查询响应性，以及流式读取行数上限；合并测试覆盖
+重叠边界（19/20）、错配边界（1/2）、多解、非 ACGT、共识质量规则、名称去
+`/1`、顺序保持、损坏输入、停止与半成品清理。
 
 ## 说明与限制
 

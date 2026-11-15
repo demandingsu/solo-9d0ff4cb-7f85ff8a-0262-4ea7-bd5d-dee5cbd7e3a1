@@ -7,6 +7,9 @@ Produces, under ``samples/``:
   quality bases in one or both ends), used to show discarding behaviour.
 * ``truncated_R2.fastq.gz`` -- a gzip stream that ends mid-record; pairing it
   with ``good_R1.fastq.gz`` makes the job fail.
+* ``merge_R1.fastq.gz`` / ``merge_R2.fastq.gz`` -- QC-passing pairs that
+  exercise the merge job: three mergeable pairs, one pair without overlap,
+  one ambiguous (homopolymer) pair, and one pair containing a non-ACGT base.
 
 Run from the repository root: ``python tools/make_samples.py``.
 """
@@ -14,6 +17,7 @@ Run from the repository root: ``python tools/make_samples.py``.
 from __future__ import annotations
 
 import gzip
+import random
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -116,6 +120,33 @@ def build() -> None:
     # R1 valid; R2 truncated at the end of the gzip stream.
     write_gzip(SAMPLES / "truncated_R1.fastq.gz", r1)
     write_truncated(SAMPLES / "truncated_R2.fastq.gz", r2)
+
+    # Merge sample: all pairs pass QC (uniform Phred 40); the merge job then
+    # merges three of them and counts one skip of each kind.
+    rng = random.Random(20240501)
+
+    def rand_seq(n: int) -> str:
+        return "".join(rng.choice("ACGT") for _ in range(n))
+
+    def revcomp(seq: str) -> str:
+        return seq.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+
+    merge_r1, merge_r2 = [], []
+    for index in range(3):  # mergeable: 120 bp fragment, 75 bp reads
+        fragment = rand_seq(120)
+        merge_r1.append(record(f"merge{index}/1", fragment[:75], HIGH * 75))
+        merge_r2.append(
+            record(f"merge{index}/2", revcomp(fragment[45:]), HIGH * 75)
+        )
+    far = rand_seq(200)  # no overlap: 200 bp fragment, 75 bp reads
+    merge_r1.append(record("far/1", far[:75], HIGH * 75))
+    merge_r2.append(record("far/2", revcomp(far[125:]), HIGH * 75))
+    merge_r1.append(record("poly/1", "A" * 60, HIGH * 60))  # ambiguous
+    merge_r2.append(record("poly/2", "T" * 60, HIGH * 60))
+    merge_r1.append(record("ns/1", "A" * 30 + "N" + "A" * 29, HIGH * 60))
+    merge_r2.append(record("ns/2", "T" * 60, HIGH * 60))
+    write_gzip(SAMPLES / "merge_R1.fastq.gz", "".join(merge_r1))
+    write_gzip(SAMPLES / "merge_R2.fastq.gz", "".join(merge_r2))
 
     print(f"samples written to {SAMPLES}")
 

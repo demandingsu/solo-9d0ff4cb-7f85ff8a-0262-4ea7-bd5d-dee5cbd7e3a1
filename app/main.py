@@ -16,6 +16,7 @@ from .jobs import (
     JobManager,
     JobNotFound,
 )
+from .merge_jobs import MergeJobManager
 from .qc import MAX_PHRED, MIN_PHRED
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ MAX_UPLOAD_BYTES = int(
 
 def _manager(request: Request) -> JobManager:
     return request.app.state.manager
+
+
+def _merge_manager(request: Request) -> MergeJobManager:
+    return request.app.state.merge_manager
 
 
 async def _save_upload(
@@ -103,10 +108,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         manager = JobManager(resolved_data_dir)
+        merge_manager = MergeJobManager(resolved_data_dir, manager)
         app.state.manager = manager
+        app.state.merge_manager = merge_manager
         try:
             yield
         finally:
+            merge_manager.shutdown()
             manager.shutdown()
 
     app = FastAPI(
@@ -119,7 +127,13 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             "ends has quality at least the threshold; otherwise the whole "
             "pair is discarded. Pair order is preserved.\n\n"
             "A job can be polled, stopped, and (after successful completion "
-            "only) downloaded."
+            "only) downloaded.\n\n"
+            "Successful QC jobs can feed a **merge job** (`POST /merge-jobs` "
+            "with the QC `job_id`): the published R1/R2 reads are streamed "
+            "pair by pair, R2 is reverse-complemented, and pairs with a "
+            "unique tail-head overlap of at least 20 bases and at most one "
+            "mismatch are merged into single-end consensus reads for "
+            "downstream variant calling."
         ),
         lifespan=lifespan,
     )
@@ -257,6 +271,110 @@ def create_app(data_dir: Path | str | None = None) -> FastAPI:
             path,
             media_type="application/gzip",
             filename=filename,
+        )
+
+    # ------------------------------------------------------------------
+    # Merge jobs: build single-end consensus reads from a successful QC job
+    # ------------------------------------------------------------------
+
+    @app.post(
+        "/merge-jobs",
+        status_code=202,
+        tags=["merge"],
+        summary="Start a merge job from a successful QC job",
+        responses={
+            202: {"description": "Merge job accepted and queued"},
+            404: {"description": "Unknown QC job"},
+            409: {"description": "QC job has not successfully completed"},
+        },
+    )
+    async def create_merge_job(
+        request: Request,
+        job_id: str = Form(
+            ...,
+            description=(
+                "Identifier of a successfully completed QC job whose "
+                "published R1/R2 outputs are merged."
+            ),
+        ),
+    ) -> dict:
+        manager = _merge_manager(request)
+        try:
+            job = manager.create_job(job_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"job {job_id!r} not found"
+            ) from None
+        except JobConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+        manager.start(job.merge_id)
+        return manager.snapshot(job.merge_id)
+
+    @app.get(
+        "/merge-jobs",
+        tags=["merge"],
+        summary="List merge jobs (newest first)",
+    )
+    async def list_merge_jobs(request: Request) -> dict:
+        manager = _merge_manager(request)
+        return {"jobs": [job.to_dict() for job in manager.list_jobs()]}
+
+    @app.get(
+        "/merge-jobs/{merge_id}",
+        tags=["merge"],
+        summary="Get merge job status and merge counts",
+        responses={404: {"description": "Unknown merge job"}},
+    )
+    async def get_merge_job(request: Request, merge_id: str) -> dict:
+        try:
+            return _merge_manager(request).snapshot(merge_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"merge job {merge_id!r} not found"
+            ) from None
+
+    @app.post(
+        "/merge-jobs/{merge_id}/stop",
+        tags=["merge"],
+        summary="Request merge job cancellation",
+        responses={
+            404: {"description": "Unknown merge job"},
+            409: {"description": "Merge job already finished"},
+        },
+    )
+    async def stop_merge_job(request: Request, merge_id: str) -> dict:
+        try:
+            return _merge_manager(request).request_stop(merge_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"merge job {merge_id!r} not found"
+            ) from None
+        except JobConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+
+    @app.get(
+        "/merge-jobs/{merge_id}/download",
+        tags=["merge"],
+        summary="Download the merged single-end FASTQ.gz (successful jobs only)",
+        response_class=FileResponse,
+        responses={
+            404: {"description": "Unknown merge job"},
+            409: {"description": "Merge job not successfully completed"},
+        },
+    )
+    async def download_merge(request: Request, merge_id: str) -> FileResponse:
+        try:
+            path = _merge_manager(request).output_path(merge_id)
+        except JobNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"merge job {merge_id!r} not found"
+            ) from None
+        except JobConflict as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from None
+        return FileResponse(
+            path,
+            media_type="application/gzip",
+            filename="merged.fastq.gz",
         )
 
     return app
